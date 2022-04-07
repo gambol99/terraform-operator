@@ -29,44 +29,80 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	runtimecontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
+// controllerLabel returns a prefixed controller name
+func controllerLabel(name string) string {
+	return "terraforms.tf.isaaguilar.com/" + name
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ReconcileTerraform) SetupWithManager(mgr ctrl.Manager) error {
-	controllerOptions := runtimecontroller.Options{
-		MaxConcurrentReconciles: r.MaxConcurrentReconciles,
+	resourceFilter := func(o client.Object) bool {
+		labels := o.GetLabels()
+		switch {
+		case labels[controllerLabel("namespace")] == "":
+			return false
+		case labels[controllerLabel("resourceName")] == "":
+			return false
+		}
+
+		return true
 	}
 
-	err := ctrl.NewControllerManagedBy(mgr).
+	return ctrl.NewControllerManagedBy(mgr).
 		For(&tfv1alpha1.Terraform{}).
-		Watches(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
-			IsController: true,
-			OwnerType:    &tfv1alpha1.Terraform{},
+		WithOptions(runtimecontroller.Options{
+			MaxConcurrentReconciles: r.MaxConcurrentReconciles,
 		}).
-		WithOptions(controllerOptions).
+		Watches(
+			&source.Kind{Type: &corev1.Pod{}},
+			handler.EnqueueRequestsFromMapFunc(func(o client.Object) []reconcile.Request {
+				if !resourceFilter(o) {
+					return nil
+				}
+
+				return []reconcile.Request{
+					{NamespacedName: types.NamespacedName{
+						Namespace: o.GetLabels()[controllerLabel("namespace")],
+						Name:      o.GetLabels()[controllerLabel("resourceName")],
+					}},
+				}
+			}),
+			builder.WithPredicates(&predicate.Funcs{
+				CreateFunc: func(e event.CreateEvent) bool {
+					return resourceFilter(e.Object)
+				},
+				DeleteFunc: func(e event.DeleteEvent) bool {
+					return resourceFilter(e.Object)
+				},
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					return resourceFilter(e.ObjectNew)
+				},
+			}),
+		).
 		Complete(r)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // ReconcileTerraform reconciles a Terraform object
 type ReconcileTerraform struct {
-	// This client, initialized using mgr.Client() above, is a split client
-	// that reads objects from the cache and writes to the apiserver
+	Cache                   *localcache.Cache
 	Client                  client.Client
-	Scheme                  *runtime.Scheme
-	Recorder                record.EventRecorder
+	EnableKubernetesBackend bool
+	JobNamespace            string
 	Log                     logr.Logger
 	MaxConcurrentReconciles int
-	Cache                   *localcache.Cache
+	Recorder                record.EventRecorder
+	Scheme                  *runtime.Scheme
 }
 
 // ParsedAddress uses go-getter's detect mechanism to get the parsed url
@@ -76,37 +112,27 @@ type ParsedAddress struct {
 	// example, git will be used to fetch git repos (over https or ssh
 	// "protocol").
 	DetectedScheme string `json:"detect"`
-
 	// Path the target path for the downloaded file or directory
 	Path string `json:"path"`
 
 	UseAsVar bool `json:"useAsVar"`
-
-	// Url is the raw address + query
-	Url string `json:"url"`
-
+	// URL is the raw address + query
+	URL string `json:"url"`
 	// Files are the files to find with a repo.
 	Files []string `json:"files"`
-
 	// Hash is also known as the `ref` query argument. For git this is the
 	// commit-sha or branch-name to checkout.
 	Hash string `json:"hash"`
-
-	// UrlScheme is the protocol of the URL
-	UrlScheme string `json:"protocol"`
-
-	// Uri is the path of the URL after the proto://host.
-	Uri string `json:"uri"`
-
+	// URLScheme is the protocol of the URL
+	URLScheme string `json:"protocol"`
+	// URI is the path of the URL after the proto://host.
+	URI string `json:"uri"`
 	// Host is the host of the URL.
 	Host string `json:"host"`
-
 	// Port is the port to use when fetching the URL.
 	Port string `json:"port"`
-
 	// User is the user to use when fetching the URL.
 	User string `json:"user"`
-
 	// Repo when using a SCM is the URL of the repo which is the same as the
 	// URL and omitting the query args.
 	Repo string `json:"repo"`
@@ -404,6 +430,11 @@ func (r *ReconcileTerraform) Reconcile(ctx context.Context, request reconcile.Re
 	generation = currentStage.Generation
 	runOpts := newRunOptions(tf)
 
+	// @step: if the job namespace is being overloaded
+	if r.JobNamespace != "" {
+		runOpts.namespace = r.JobNamespace
+	}
+
 	if tf.Spec.ExportRepo != nil && podType != tfv1alpha1.PodSetup {
 		// Run the export-runner
 		exportedStatus, err := r.exportRepo(ctx, tf, runOpts, generation, reqLogger)
@@ -430,7 +461,7 @@ func (r *ReconcileTerraform) Reconcile(ctx context.Context, request reconcile.Re
 			tf.Status.Phase = tfv1alpha1.PhaseCompleted
 			if tf.Spec.WriteOutputsToStatus {
 				// runOpts.outputsSecetName
-				secret, err := r.loadSecret(ctx, runOpts.outputsSecretName, runOpts.namespace)
+				secret, err := r.loadSecret(ctx, runOpts.outputsSecretName, tf.Namespace)
 				if err != nil {
 					reqLogger.Error(err, fmt.Sprintf("failed to load secret '%s'", runOpts.outputsSecretName))
 				}
@@ -471,12 +502,13 @@ func (r *ReconcileTerraform) Reconcile(ctx context.Context, request reconcile.Re
 	}
 
 	// Check for the current stage pod
-	inNamespace := client.InNamespace(tf.Namespace)
+	inNamespace := client.InNamespace(runOpts.namespace)
 	f := fields.Set{
 		"metadata.generateName": fmt.Sprintf("%s-%s-", tf.Status.PodNamePrefix+"-v"+fmt.Sprint(generation), podType),
 	}
 	labels := map[string]string{
-		"terraforms.tf.isaaguilar.com/generation": fmt.Sprintf("%d", generation),
+		controllerLabel("namespace"):  tf.Namespace,
+		controllerLabel("generation"): fmt.Sprintf("%d", generation),
 	}
 	matchingFields := client.MatchingFields(f)
 	matchingLabels := client.MatchingLabels(labels)
@@ -1045,6 +1077,18 @@ func (r *ReconcileTerraform) setupAndRun(ctx context.Context, tf *tfv1alpha1.Ter
 			runOpts.mainModuleAddonData["backend_override.tf"] = tf.Spec.CustomBackend
 		}
 
+		if r.EnableKubernetesBackend {
+			// @step: we always override the backend.tf when the backend is enabled
+			runOpts.mainModuleAddonData["backend_override.tf"] = fmt.Sprintf(`
+terraform {
+	backend "kubernetes" {
+		secret_suffix     = "state-%s"
+		in_cluster_config = true
+		namespace         = "%s"
+	}
+}`, tf.GetUID(), runOpts.namespace)
+		}
+
 		if tf.Spec.PreInitScript != "" {
 			runOpts.mainModuleAddonData[string(tfv1alpha1.PodPreInit)] = tf.Spec.PreInitScript
 		}
@@ -1423,8 +1467,12 @@ func (r ReconcileTerraform) createPod(ctx context.Context, tf *tfv1alpha1.Terraf
 		preScriptPodType = tfv1alpha1.PodPreApplyDelete
 	}
 
-	resource := runOpts.generatePod(podType, preScriptPodType, isTFRunner, generation)
-	controllerutil.SetControllerReference(tf, resource, r.Scheme)
+	resource := runOpts.generatePod(podType, preScriptPodType, isTFRunner, generation, tf)
+
+	// @step: if the pods are within the same namespace we can set the owner reference
+	if tf.Namespace == runOpts.namespace {
+		controllerutil.SetControllerReference(tf, resource, r.Scheme)
+	}
 
 	err := r.Client.Create(ctx, resource)
 	if err != nil {
@@ -1436,15 +1484,13 @@ func (r ReconcileTerraform) createPod(ctx context.Context, tf *tfv1alpha1.Terraf
 }
 
 func (r RunOptions) generateConfigMap() *corev1.ConfigMap {
-
-	cm := &corev1.ConfigMap{
+	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      r.versionedName,
 			Namespace: r.namespace,
 		},
 		Data: r.mainModuleAddonData,
 	}
-	return cm
 }
 
 func (r RunOptions) generateServiceAccount() *corev1.ServiceAccount {
@@ -1459,14 +1505,13 @@ func (r RunOptions) generateServiceAccount() *corev1.ServiceAccount {
 		}
 	}
 
-	sa := &corev1.ServiceAccount{
+	return &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        r.serviceAccount, // "tf-" + r.versionedName
 			Namespace:   r.namespace,
 			Annotations: annotations,
 		},
 	}
-	return sa
 }
 
 func (r RunOptions) generateRole() *rbacv1.Role {
@@ -1566,8 +1611,7 @@ func (r RunOptions) generatePVC(size resource.Quantity) *corev1.PersistentVolume
 	}
 }
 
-func (r RunOptions) generatePod(podType, preScriptPodType tfv1alpha1.PodType, isTFRunner bool, generation int64) *corev1.Pod {
-
+func (r RunOptions) generatePod(podType, preScriptPodType tfv1alpha1.PodType, isTFRunner bool, generation int64, tf *tfv1alpha1.Terraform) *corev1.Pod {
 	generateName := r.versionedName + "-" + string(podType) + "-"
 
 	generationPath := "/home/tfo-runner/generations/" + fmt.Sprint(generation)
@@ -1930,10 +1974,11 @@ func (r RunOptions) generatePod(podType, preScriptPodType tfv1alpha1.PodType, is
 	}
 
 	labels := make(map[string]string)
-	labels["terraforms.tf.isaaguilar.com/generation"] = fmt.Sprintf("%d", generation)
-	labels["terraforms.tf.isaaguilar.com/resourceName"] = r.tfName
-	labels["terraforms.tf.isaaguilar.com/podPrefix"] = r.name
-	labels["terraforms.tf.isaaguilar.com/terraformVersion"] = r.terraformVersion
+	labels[controllerLabel("namespace")] = tf.Namespace
+	labels[controllerLabel("generation")] = fmt.Sprintf("%d", generation)
+	labels[controllerLabel("resourceName")] = r.tfName
+	labels[controllerLabel("podPrefix")] = r.name
+	labels[controllerLabel("terraformVersion")] = r.terraformVersion
 	labels["app.kubernetes.io/name"] = "terraform-operator"
 	labels["app.kubernetes.io/component"] = "terraform-operator-runner"
 	labels["app.kubernetes.io/instance"] = string(podType)
@@ -2130,7 +2175,7 @@ func (r ReconcileTerraform) run(ctx context.Context, reqLogger logr.Logger, tf *
 			}
 		}
 
-		if err := r.createSecret(ctx, tf, runOpts.outputsSecretName, runOpts.namespace, map[string][]byte{}, false); err != nil {
+		if err := r.createSecret(ctx, tf, runOpts.outputsSecretName, tf.Namespace, map[string][]byte{}, false); err != nil {
 			return err
 		}
 
@@ -2391,12 +2436,12 @@ func getParsedAddress(address, path string, useAsVar bool, scmMap map[string]scm
 		DetectedScheme: scheme,
 		Path:           path,
 		UseAsVar:       useAsVar,
-		Url:            parsedURL.String(),
+		URL:            parsedURL.String(),
 		Files:          files,
 		Hash:           hash,
-		UrlScheme:      parsedURL.Scheme,
+		URLScheme:      parsedURL.Scheme,
 		Host:           parsedURL.Host,
-		Uri:            strings.Split(parsedURL.RequestURI(), "?")[0],
+		URI:            strings.Split(parsedURL.RequestURI(), "?")[0],
 		Port:           port,
 		User:           parsedURL.User.Username(),
 		Repo:           strings.Split(parsedURL.String(), "?")[0],
@@ -2419,12 +2464,13 @@ func (r *ReconcileTerraform) exportRepo(ctx context.Context, tf *tfv1alpha1.Terr
 		return exportedStatus, nil
 	}
 
-	inNamespace := client.InNamespace(tf.Namespace)
+	inNamespace := client.InNamespace(runOpts.namespace)
 	f := fields.Set{
 		"metadata.generateName": fmt.Sprintf("%s-%s-", tf.Status.PodNamePrefix+"-v"+fmt.Sprint(generation), exportPodType),
 	}
 	labels := map[string]string{
-		"terraforms.tf.isaaguilar.com/generation": fmt.Sprintf("%d", generation),
+		controllerLabel("generation"): fmt.Sprintf("%d", generation),
+		controllerLabel("namespace"):  tf.Namespace,
 	}
 	matchingFields := client.MatchingFields(f)
 	matchingLabels := client.MatchingLabels(labels)

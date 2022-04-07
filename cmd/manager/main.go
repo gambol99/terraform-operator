@@ -37,10 +37,17 @@ func init() {
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
+	var enableKubernetesBackend bool
 	var probeAddr string
 	var maxConcurrentReconciles int
+	var namespace string
+	var jobNamespace string
+
+	flag.StringVar(&namespace, "namespace", "", "The namespace the operator should watch, defaults to all.")
+	flag.StringVar(&jobNamespace, "job-namespace", "", "Runs the jobs in an alternative namespace to the terraform resource.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableKubernetesBackend, "enable-kubernetes-backend", false, "Enables by default the kubernetes backend.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -56,25 +63,32 @@ func main() {
 	c := localcache.New(60*time.Second, 3600*time.Second)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		MetricsBindAddress:     metricsAddr,
-		Port:                   9443,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "050c8fba.isaaguilar.com",
+		MetricsBindAddress:     metricsAddr,
+		Namespace:              namespace,
+		Port:                   9443,
+		Scheme:                 scheme,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
+	if jobNamespace != "" {
+		setupLog.Info("Using job namespace", "namespace", jobNamespace)
+	}
+
 	if err = (&controllers.ReconcileTerraform{
+		Cache:                   c,
 		Client:                  mgr.GetClient(),
+		EnableKubernetesBackend: enableKubernetesBackend,
 		Log:                     ctrl.Log.WithName("terraform_controller"),
+		JobNamespace:            jobNamespace,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
 		Recorder:                mgr.GetEventRecorderFor("terraform-controller"),
 		Scheme:                  mgr.GetScheme(),
-		MaxConcurrentReconciles: maxConcurrentReconciles,
-		Cache:                   c,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Cluster")
 		os.Exit(1)
